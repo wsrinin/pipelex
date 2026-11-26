@@ -6905,6 +6905,8 @@ Use fixed output multiplicity when:
 - External requirements dictate a fixed count
 - You want consistent batch sizes for processing
 
+The language sets no upper bound on `N`, but a runtime may: validating a method dry-runs it with one mock item per declared item, so a runtime can refuse to load a method declaring more items for one slot than it allows. Pipelex's maximum, and how to raise it, is described in [Library Configuration](../../configuration/config-technical/library-config.md#how-many-items-a-method-may-declare). It covers `Concept[N]` on inputs and outputs, a controller step's `nb_output`, and a run's own `output_multiplicity` alike, and a dependency package's pipes as well as the method's own. Variable lists, `Concept[]`, declare no count and are never refused by it. A dry run also builds at most a budget of mock items in all, `max_dry_run_mock_items`, so many fixed counts together, or a batch over a fixed list whose branches each build another, can be refused even when every count is within the maximum.
+
 ### When to Use Variable Input (Empty Brackets `[]`)
 
 Use variable input multiplicity when:
@@ -9787,6 +9789,14 @@ The setting is read **once, when the run's parameters are built**, and then froz
 Results always preserve input order regardless of the concurrency bound. If a branch fails, the failure propagates and the first error by input index wins.
 
 For durable, rate-limited execution of very large batches, run the pipeline on the Temporal track.
+
+## Very wide batches on a durable runtime
+
+On a durable runtime, a run keeps a history of what it did, and its engine bounds that history in bytes and in events. Every item of a batch writes into its run's history what its branch starts with and what it hands back, so the number of items a batch can run depends on how large each item and its branch's inputs are, not on a fixed item count.
+
+Before its first item starts, a `PipeBatch` asks the runtime's router whether the whole batch fits. A runtime that runs in one process keeps no such history and always answers yes. A durable runtime may estimate what the batch would write from its first item and its item count, and refuse a batch that would not fit, before any item is billed, rather than let its engine end the run halfway; a runtime that does not check lets the batch run. A refused batch fails at the `PipeBatch` with `input.too_large`, whose `input` is the batched list as you named it, whose `size` is its item count and whose `limit` is the largest item count that fits, left out when not even one item fits; its message, for the operator, also names the bytes and the events the batch would write and those the run had left. When items later in the list turn out much larger than the first, the runtime may also stop the batch during its fan-out, with the same code and a message saying how many items had started.
+
+To run a list that is refused, split it into shorter lists, each batched by a run of its own, or make each item, and what its branch pipe reads besides it, smaller. When not even one item fits, only smaller items help, and the refusal says so.
 
 ## Compaction Under Absence
 
@@ -15898,6 +15908,29 @@ A method of a server's own library directories that refuses to load for any othe
 
 A process that loads the same transported method again and again, such as a hosted worker running every branch of a batch, builds the method's concept classes once: `load_from_crate` keeps them per crate and hands the same classes to every later load of it. The `max_classes` key under `[interpreter.crate_class_cache]` in `pipelex.toml` bounds the classes kept over all methods, the least recently used method leaving first, and `0` turns the cache off. Loading library directories never uses it. [Runtime Bridge & Transport](../../under-the-hood/runtime-bridge-and-transport.md) says when a load may reuse the classes.
 
+## How Many Items a Method May Declare
+
+A method can declare a fixed number of items for one slot in three ways: an input or an output written `Concept[N]`, and a controller step's `nb_output = N`, which reaches a `PipeLLM` step as the number of objects it generates and a `PipeImgGen` step as the number of images. A run can ask for one too, with its `output_multiplicity`. A dry run, the one every validation runs, builds one mock item for each declared item, so a few characters of a method could otherwise make a validation build millions of objects.
+
+Every load therefore holds each declared count to a maximum, and every dry run to a budget, set under `[interpreter.method_limits]`:
+
+```toml
+[interpreter.method_limits]
+max_declared_item_count = 1000
+max_declared_item_count_ceiling = 1000
+max_dry_run_mock_items = 100000
+```
+
+A load for a validation or a run reads every count the method declares, in its own bundles and in the dependency packages it loads, before it builds anything, and refuses a method declaring more items for one slot than the maximum with [`pipelex.deployment.declared_count_over_limit`](../../errors/pipelex/deployment/declared_count_over_limit.md), naming the slot, the count and the maximum. A validation answers it as its invalid verdict, and a run refuses to start. A run whose own `output_multiplicity` passes the maximum is refused the same way before it starts. The dry run's mock builders hold the same maximum, so a path that skipped the load's check cannot build more mock items either: for a fixed count they refuse rather than build fewer, since a fixed slot's value must have its declared length. A variable list, `Concept[]`, declares no count: the dry run builds it at its own default length, `inference.dry_run.nb_list_items`, shortened to the maximum when the maximum is lower, so a method declaring no count is never refused by it.
+
+The maximum is this runtime's, not a rule of the MTHDS language: a method declaring 5,000 items is valid MTHDS that this runtime, at its default, refuses to load. To accept larger counts, raise `max_declared_item_count` in your project's `.pipelex/pipelex.toml`, and `max_declared_item_count_ceiling` with it: the configuration refuses a maximum above its own ceiling.
+
+A host serving several callers may raise the maximum per request: the Pipelex API takes a [`max_declared_item_count`](../../api-server/pipe-run.md#declared-item-count-max_declared_item_count) on its run, validation and method routes, and a run carries it to every process that runs a part of it, so a worker holds the run to the request's maximum rather than its own configuration. A request's maximum only raises the deployment's: the larger of the two is in force, so a maximum below the deployment's is accepted and changes nothing, and a method of the host's own library directories, its installed methods or `PIPELEXPATH`, loading beside the caller's, is never refused for what the caller states. That field arrives in a request's JSON body, so a caller could raise its own limit: a request's maximum may be at most `max_declared_item_count_ceiling`, and one above it is a `422` `request.invalid` naming the field. By default the ceiling equals the deployment's maximum, so no request can raise it. A deployment that sits behind a trusted front setting each request's maximum itself, as the hosted plane does from the caller's plan, raises `max_declared_item_count_ceiling` to the highest maximum that front sends, and that front strips the field from what its own callers send.
+
+The maximum bounds one slot at a time, which leaves their sum and their products open: twenty inputs each declaring the maximum, or a batch over a list whose every branch builds another list, make one dry run build far more than any slot declares. So every item a dry run builds, a mock input, a mock output or a text a dry `PipeCompose` renders, whatever the slot, counts against one budget, `max_dry_run_mock_items`, shared by the concurrent branches of a batch. The budget covers one in-process validation, the hosted validation sweep included since it runs in one activity, and one in-process dry run, its mock inputs and its pipes together. A dry run that would pass it is refused with [`pipelex.deployment.dry_run_mock_budget_exceeded`](../../errors/pipelex/deployment/dry_run_mock_budget_exceeded.md), naming the budget. A request cannot change the budget. A distributed dry run, whose pipes run in worker activities, counts each activity against a budget of its own, so there the bound holds per activity, not per run.
+
+Whatever the maximum, a count is written with at most nine significant digits, leading zeros aside: the parser refuses a longer one before it reads the number, and no configuration or request may set a maximum above 999,999,999.
+
 ## Project Organization
 
 **Golden rule:** Put `.mthds` files where they make sense in YOUR project. Pipelex finds them automatically.
@@ -16932,6 +16965,8 @@ What varies goes in `fields`, named by the [naming convention](#naming-conventio
 | `delivery_failure` | string | Why a caller webhook's delivery, or one attempt of it, failed: `http_status`, `timeout`, `unreachable`, `refused_address` or `secret_unavailable` |
 | `storage_scheme` | string or `null` | The kind of storage a deployment's storage provider is, as a `pipelex.storage.*` problem names it: `s3`, `local`; `null` for a storage plugin whose kind the registry does not list |
 | `blob_sha256` | string | The SHA-256 a blob is stored under in the API server's blob store, in lowercase hex: its content's hash, never its content |
+| `requested_reference_count` | integer | The number of `pipelex-storage://` references one request to the API server's bulk resolve route asked to resolve |
+| `refused_reference_count` | integer | The number of those references the route refused because they lie outside the caller's scope |
 | `blob_size_bytes`, `read_size_bytes` | integer | The size the API server's blob store holds a blob at, and the size of the bytes a read of it returned, in bytes |
 | `env_var` | string | The name of an environment variable, never its value |
 | `default_value` | integer | The value a setting falls back to when its environment variable holds none it can use |
@@ -18215,7 +18250,7 @@ summaries = extract_main_content_as_list(memory=result.memory, item_type=Summary
 
 `PipelexKernel` holds run-scoped identity, plus the one seam that identity needs:
 
-- **`job_metadata`** — the run-level metadata. **The two halves are now separate types, and a caller reading a field off this object must know which half it is in.** `JobMetadata.run_metadata` holds what is constant for the whole run — `user_id`, `pipeline_run_id`, `storage_scope`, `read_scope`, `request_id`, `extras` — and the rest of `JobMetadata` holds what changes per step (`pipe_code`, `pipe_run_id`, `otel_context`). So it is `kernel.job_metadata.run_metadata.pipeline_run_id`, not `kernel.job_metadata.pipeline_run_id`; there is deliberately no read-through accessor, so one fact has one spelling. `user_id`, `storage_scope`, `read_scope`, `request_id` and `extras` are supplied by the host at `PipelexKernel.make(...)` — the last of them opaque, so a multi-tenant host can attribute a kernel-driven run to its own entities without the runtime learning what they are. `request_id` is the inbound request the run serves, validated by `RunMetadata` exactly as on the pipeline entry points, and it is what a hosted deployment filters its logs on. The distinction this bullet already drew informally — run-level metadata, per-step copy — is what the split makes explicit, and it is why the per-step copy can carry the run half through untouched. It is not what a step runs under: every call mints a per-step copy through `make_step_metadata()`, carrying a fresh `pipe_run_id` and inheriting the trace context, so trace and usage attribution stay per-step. This mirrors the interpreter's pass-down-a-modified-copy pattern. `make_step_metadata(pipe_code=…)` names the pipe the step is running — mirroring what the interpreter stamps on its live and dry paths — so log correlation, usage accounting, and the per-step labelling a distributed backend derives see a named step. When no `pipe_code` is supplied the key is omitted from the update rather than passed as `None`, so a run-level `pipe_code` is never silently erased; the direct-call façade (`llm_text`/`llm_object`) stays deliberately anonymous, because the caller ran no pipe.
+- **`job_metadata`** — the run-level metadata. **The two halves are now separate types, and a caller reading a field off this object must know which half it is in.** `JobMetadata.run_metadata` holds what is constant for the whole run — `user_id`, `pipeline_run_id`, `storage_scope`, `read_scope`, `request_id`, `extras` — and the rest of `JobMetadata` holds what changes per step (`pipe_code`, `pipe_run_id`, `otel_context`). So it is `kernel.job_metadata.run_metadata.pipeline_run_id`, not `kernel.job_metadata.pipeline_run_id`; there is deliberately no read-through accessor, so one fact has one spelling. `user_id`, `storage_scope`, `read_scope`, `request_id` and `extras` are supplied by the host at `PipelexKernel.make(...)` — the last of them opaque, so a multi-tenant host can attribute a kernel-driven run to its own entities without the runtime learning what they are. `request_id` is the inbound request the run serves, validated by `RunMetadata` exactly as on the pipeline entry points, and it is what a hosted deployment filters its logs on. `max_declared_item_count`, also supplied at `make(...)`, raises the most items one slot of the run may hold, such as the list a dry `llm_object` step builds, the larger of it and the deployment's maximum being in force; it is validated as `pipeline_run_setup` validates it, a whole number from one to the deployment's `[interpreter.method_limits] max_declared_item_count_ceiling`, and rides `RunMetadata`, where every dry leaf a step reaches reads it, in this process or a worker's activity. Left out, the deployment's `max_declared_item_count` applies. The distinction this bullet already drew informally — run-level metadata, per-step copy — is what the split makes explicit, and it is why the per-step copy can carry the run half through untouched. It is not what a step runs under: every call mints a per-step copy through `make_step_metadata()`, carrying a fresh `pipe_run_id` and inheriting the trace context, so trace and usage attribution stay per-step. This mirrors the interpreter's pass-down-a-modified-copy pattern. `make_step_metadata(pipe_code=…)` names the pipe the step is running — mirroring what the interpreter stamps on its live and dry paths — so log correlation, usage accounting, and the per-step labelling a distributed backend derives see a named step. When no `pipe_code` is supplied the key is omitted from the update rather than passed as `None`, so a run-level `pipe_code` is never silently erased; the direct-call façade (`llm_text`/`llm_object`) stays deliberately anonymous, because the caller ran no pipe.
 - **`cogt_run_params`** — the execution-mode contract (`run_mode`, and the DRY-only `is_mock_usage` sub-flag) that every cogt leaf reads off the assignment it is handed.
 - **`step_id_source`** — where each step's `pipe_run_id` comes from, defaulting to a fresh `uuid4`, which is what every in-process run wants. It exists for a kernel hosted inside a replay-based executor, where ids minted from a non-replay-safe source take different values each re-execution; such a host injects its own replay-safe source via `PipelexKernel.make(step_id_source=…)`. It is a seam, not state — the kernel never inspects what it returns.
 - **The run's own id** follows the same rule, once per run rather than once per step. `make` takes it from a `trace_context`'s `graph_id` when one is given, else from `pipeline_run_id=…`, else from a fresh `uuid4`. A supplied id, a `pipeline_run_id` or a trace context's `graph_id`, follows the one rule of a run id, the one `execute` and `RunMetadata` apply too (`validate_pipeline_run_id` in `pipelex/system/job_metadata.py`): one to 128 ASCII letters, digits, `_` or `-`, and neither `untitled` nor `dry_run_untitled`, which are reserved. Any other value, the empty string included, raises a `RunParameterError`, a `ValueError`, rather than a minted id taking its place. **A host inside a replay-based executor must pass one of the two**, because the `uuid4` default re-mints on every replay and the replayed run would then name itself differently from the run it replays. Such a host mints the id from its own replay-safe source (a workflow's deterministic random, or its workflow id when that already follows the rule) and passes the value; a value is enough here where the step id needs a callable, because the run id is minted exactly once.
@@ -22499,6 +22534,18 @@ async def run_batch_branch(self, pipe_job: PipeJob) -> PipeOutput:
 
 The default body IS the behavior for in-process routers — a branch is just a run, so `PipeRouter` deliberately does not override it and nothing about direct execution changed. A **distributed** router may override it to give each branch its own isolation (own retry, own history partition) while every other dispatch it receives runs inline. Because the default delegates to `run` and not to `_run_pipe_job`, batch branches still pass through the observer hooks.
 
+### The batch-fits hook
+
+A distributed router sees a batch's branches one at a time, through `run_batch_branch`, and never the batch's width; `PipeBatch` knows the width but not what a branch costs in a durable history. So `PipeRouterProtocol` carries a second batch entry point, synchronous, whose default body does nothing:
+
+```python
+def check_batch_fits(self, *, pipe_code: str, input_list_label: str, item_count: int, first_branch_job: PipeJob) -> None: ...
+```
+
+`PipeBatch` calls it once per batch, after it knows its item count and before it records its fan-out or starts any branch, and never for an empty list. `first_branch_job` is the very job the first branch then dispatches through `run_batch_branch`, built by the same function that builds every branch's job, so a router that measures it measures what it will send; it reads the job and never changes it. `input_list_label` names the list as its author wrote it (`BatchParams.input_list_label`). The hook is called in a dry run too, whose job's `run_mode` says so.
+
+In-process routers keep the default: every batch fits. A durable router may estimate what the whole batch would write into its run's history and refuse by raising `PipeBatchTooWideError` (`pipelex/pipe_controllers/exceptions.py`), which fails the `PipeBatch` located at it, with no fan-out recorded and no branch started. The error takes the batch's figures as keyword arguments (the pipe code, the list's label, the item count, the estimated bytes and events, the bytes and events left, the largest item count that fits, and, for a batch stopped during its fan-out rather than refused before it, the number of items started) and builds its message from them, so the wording is Pipelex's whichever backend raises it. Its problem is `input.too_large`, whose `input` is the list's label, `size` the item count and `limit` the largest count that fits. When that count is zero, no shorter list would run: the problem withholds `limit`, so the code's sentence for a withheld limit applies, and the message and the advice ask for smaller items.
+
 ---
 
 ## Pipe Controllers
@@ -22671,6 +22718,7 @@ flowchart TB
 | PipeSequence | `pipelex/pipe_controllers/sequence/pipe_sequence.py` |
 | PipeCondition | `pipelex/pipe_controllers/condition/pipe_condition.py` |
 | PipeBatch | `pipelex/pipe_controllers/batch/pipe_batch.py` |
+| PipeBatchTooWideError | `pipelex/pipe_controllers/exceptions.py` |
 | PipeParallel | `pipelex/pipe_controllers/parallel/pipe_parallel.py` |
 | Router selection | `pipelex/pipelex.py` (in `Pipelex.setup()`) |
 
@@ -23104,7 +23152,7 @@ A worker implements the provider half of a call, `_gen_text` or `_extract_pages`
 
 | Symbol | Module | Role |
 |--------|--------|------|
-| `BackendExtrasFactory` | `pipelex.plugins.backend_extras_factory` | the per-request headers and body additions a worker asks its factory for |
+| `BackendExtrasFactory` | `pipelex.plugins.backend_extras_factory` | the per-request headers and body additions a worker asks its factory for, and its `is_storage_uri_enabled` flag, which keeps stored prompt files as references for a backend that reads Pipelex storage itself ([Storage Provider Plugins](storage-provider-plugins.md#a-backend-that-reads-the-storage-itself)) |
 | `OpenAICompletionsFactory` | `pipelex.providers.openai.openai_completions_factory` | extension base for a Chat Completions service: messages, client, extras |
 | `OpenAIResponsesFactory` | `pipelex.providers.openai.openai_responses_factory` | extension base for a Responses service |
 | `OpenAICompletionsLLMWorker` | `pipelex.providers.openai.openai_completions_llm_worker` | the Chat Completions LLM worker, built with a factory |
@@ -23119,7 +23167,7 @@ A worker implements the provider half of a call, `_gen_text` or `_extract_pages`
 | `prep_prompt_images` | `pipelex.cogt.image.prompt_image_utils` | prompt images, prepared for a request |
 | `PromptImageDetail` | `pipelex.cogt.image.prompt_image` | the detail level a prompt image asks for |
 | `prep_prompt_documents` | `pipelex.cogt.document.prompt_document_utils` | prompt documents, prepared for a request |
-| `PreparedFileBase64`, `PreparedFileHttpUrl`, `PreparedFileLocalPath` | `pipelex.tools.uri.prepared_file` | the forms a prepared file takes |
+| `PreparedFileBase64`, `PreparedFileHttpUrl`, `PreparedFileStorageUri`, `PreparedFileLocalPath` | `pipelex.tools.uri.prepared_file` | the forms a prepared file takes |
 | `make_base64_url_from_any_uri` | `pipelex.tools.uri.uri_base64` | a file reference, inlined as a data URL |
 
 **Errors: distilling, classifying and rendering a failure**
@@ -23581,6 +23629,26 @@ Each entry says, about one code:
 | `user_action_kind` | the kind of the error's advice |
 | `detail` | the advice itself: what the caller, or whoever operates the service, should do. The local CLIs print it as a tip beside the error; a problem never carries it, since its step is the code's. The service's message already names the specifics, so the advice need not repeat them |
 | `is_model_not_found` | set for a code that means the service does not know the model at all: it selects the family's `*ModelNotFoundError` class, which the pipe layer re-raises as a model-availability error carrying the model handle, and its `error_code` is then `model.unavailable` |
+| `body_params` | the parameters of `error_code` the service states in its error body, each mapped to the field holding it; empty by default. See [The facts of a refusal](#the-facts-of-a-refusal) |
+
+## The facts of a refusal
+
+A problem's sentences are rendered from its code's templates and its parameters, never from the service's message, which rides the operator's diagnostics alone. So a code whose sentence names facts, such as `input.too_large` ("The input '{input}' reaches {size}, past the limit of {limit}."), renders them for the caller only when the error is given them; without them the caller reads the code's title, "An input exceeds a size limit", and the problem builder logs that a required parameter is missing.
+
+A service that knows the facts states them as fields of its error body, in its own vocabulary, and the entry maps them to the registry's names:
+
+```python
+ServiceErrorCode(
+    code="acme_files_too_large",
+    category=InferenceErrorCategory.CONTENT,
+    error_code=CoreCode.INPUT_TOO_LARGE,
+    user_action_kind=UserActionKind.CHANGE_INPUT,
+    detail="The files are over the provider's limit — use smaller files.",
+    body_params={"input": "reference", "size": "size_bytes", "limit": "limit_bytes"},
+)
+```
+
+When a refusal matches the entry, `render_inference_error` reads each field from the body the worker's Extract step kept (`ProviderErrorMetadata.body`), in its `error` section first and then at its top level, where the OpenAI client leaves the section's fields (`error_body_sections` in `pipelex.cogt.inference.error_classification`), and gives the values it finds to the error with `with_params`. A field the body does not hold, or holds as `null` or an empty string, is left out, and the problem renders the sentences its code has for the parameters it was given; a value of the wrong type is dropped and logged by the problem builder, as for any raise site. An entry naming a parameter its `error_code` does not declare is refused when it is built. So is an entry that reads a parameter the runtime states itself: `model`, `model_type`, `reason`, `provider` and `pipe` everywhere, since the caller knows a model by the handle the method named rather than by a service's own id for it, `limit` on `model.context_exceeded`, whose bound the renderer names, and any parameter at all on an entry that means the model is not found. A service rarely knows which method input a file came from, so its `input` is whatever names the file to the caller, such as the reference the method's input held.
 
 ## How the runtime reads them
 
@@ -23596,6 +23664,8 @@ At boot, every plugin's contributions are frozen into one `ServiceErrorVocabular
 |-----------|-------|
 | an entry whose `error_code` no family's failure class declares, a model-not-found entry whose `error_code` is not `model.unavailable`, or a `TRANSIENT` entry whose `error_code` does not invite a retry | a validation error when the plugin builds the entry, at import |
 | two plugins contribute the same code | `DuplicateServiceErrorCodeError`, naming both plugins |
+| an entry whose `body_params` names a parameter its `error_code` does not declare | a validation error when the plugin builds the entry, at import |
+| an entry whose `body_params` names a parameter the runtime states itself, or any parameter on a model-not-found entry | a validation error when the plugin builds the entry, at import |
 | a plugin contributes a code the runtime classifies itself (`model_not_allowed_error`, see the [Error Model](error-model.md#a-model-the-integration-does-not-allow)) | `ReservedServiceErrorCodeError` |
 
 The vocabulary is a kernel-layer contribution: a plugin published under `pipelex.plugins.kernel` may contribute it, since inference errors are classified in a kernel-only boot too.
@@ -24088,6 +24158,41 @@ Besides files, a provider holds the large texts of a run: every `Text`, `Markdow
 ### A provider is not the tenant boundary
 
 A provider reads any key it is handed with the process's own credentials, and it should: it has no notion of whose run asked. On a host serving several tenants, what bounds a run's reads is the **read scope** the host passes with the run, which the content-generation leaves and the input seam check before they call a provider. A key outside that prefix, and any local path, is refused there, so a provider never sees it. A self-hosted deployment serving one tenant passes no read scope and reads as before. See [Distributed Content Generation](distributed-content-generation.md#what-a-leaf-may-read-the-read-scope) for the rule and where it runs.
+
+### How a stored object reaches a client
+
+A run hands its large texts, the images it generates and the files it receives back as `pipelex-storage://` references, and a client reads one through a server, never through the provider. On the hosted platform, the platform resolves a reference to a presigned link on its bucket. A self-hosted API server resolves it to a signed link on its own download route, `GET /v1/storage/{key}`, which reads the object with `load_with_metadata` and answers its bytes under a validated bare media type: the `type/subtype` of the type the provider returns, else the one the key's extension implies. A plugin's provider is taken to return the type an object was stored with, as the S3 and GCP providers do; the local and in-memory providers return a type sniffed from the bytes, so for them the key's extension comes first. So a provider serves those downloads through the same hook a run's reads use, and a missing object must raise `StorageFileNotFoundError`, which the route answers as a `404`. The server decides which references a caller may resolve, the caller's own under `AUTH_MODE=jwt`, as the provider itself checks nothing. See [Storage Transport](../api-server/storage-transport.md).
+
+---
+
+## A backend that reads the storage itself
+
+When a prompt carries an image or a document stored as a `pipelex-storage://` URI, the runtime normally reads the object through the storage provider and hands the model's SDK its bytes, as base64. That is the only shape the providers Pipelex ships can take, since none of them can read Pipelex storage. A backend whose service *can* read that storage, because it runs beside the bucket with credentials of its own, gains nothing from the download: the bytes cross the runtime's memory and the request body for no reason, and a large file can exceed the request's size limit long before it exceeds the model's. Such a backend can ask for stored files to be kept as references.
+
+The opt-in is the `is_storage_uri_enabled` flag of `BackendExtrasFactory` (`pipelex/plugins/backend_extras_factory.py`), the per-backend factory a worker already consults for each request's extras. It is a keyword argument of the factory's constructor, off by default, and no backend Pipelex ships turns it on, so their requests are unchanged. A plugin backend turns it on when it builds its factory, typically from a setting of its own in the backend's `extra_config`:
+
+```python
+OpenAIResponsesLLMWorker(
+    openai_responses_factory=MyResponsesFactory(is_http_url_enabled=False, is_storage_uri_enabled=True),
+    ...
+)
+AnthropicLLMWorker(
+    ...,
+    extras_factory=MyAnthropicExtrasFactory(is_storage_uri_enabled=True),
+)
+```
+
+With the flag on, `prep_prompt_images` and `prep_prompt_documents` (and their single-file forms `prepare_prompt_image` and `prepare_prompt_document`) return a `PreparedFileStorageUri` for each stored file, carrying the URI unchanged, and make no storage read at all. Each factory then sends that URI where it would send a URL:
+
+| Factory | Images | Documents |
+|---------|--------|-----------|
+| `OpenAIResponsesFactory` | `input_image` with `image_url` set to the URI | `input_file` with `file_url` set to the URI, and no filename |
+| `AnthropicFactory`, through `AnthropicLLMWorker` | an `image` block whose `source` is `{"type": "url", "url": <the URI>}` | a `document` block whose `source` is `{"type": "url", "url": <the URI>}` |
+| `OpenAICompletionsFactory` | `image_url` with `url` set to the URI | still inlined: the Chat Completions file part has no URL form, so a backend that needs documents as references overrides `make_simple_messages` with a part that can carry the URI |
+
+Only stored files change. An `https://` URL keeps following `is_http_url_enabled`, a local path is still read, and an inline or `data:` file is still sent as base64. The Anthropic worker reads the flag from its `extras_factory`, so a worker built without one, as every Anthropic and Bedrock backend Pipelex ships is, keeps inlining.
+
+Turn it on only for a backend that really reads the storage the runtime writes to: the same bucket, under the same keys, with credentials that can read them. A model provider receiving a `pipelex-storage://` URI it cannot resolve refuses the request. Keeping a reference does not widen what a run may read: the content-generation leaf checks every prompt file against the run's read scope before it calls the worker, whether or not the bytes are then loaded (see [A provider is not the tenant boundary](#a-provider-is-not-the-tenant-boundary)).
 
 ---
 
@@ -25637,7 +25742,8 @@ InferenceErrorCategory.TRANSIENT.is_retryable  # True — only TRANSIENT
 | Content-policy violation | `CONTENT` → not repeated; `UserAction(CHANGE_INPUT)`; `model.content_refused` → **HTTP 422** |
 | Malformed prompt image / bad prompt parameter | `CONTENT` class-level (`PromptImageFormatError`, `LLMPromptParameterError`, …), each with its own code (`input.file_type_unsupported`, `pipe.prompt_empty`, …) |
 | A provider **HTTP 400**, or another 4xx such as the 422 or 413 a gateway may answer, saying the inputs are over what the model can read (OpenAI's `context_length_exceeded` code, which Azure OpenAI and OpenAI-compatible gateways relay, or a provider's own wording, read in the rendered message and in the body, where a raw `httpx` error such as Azure REST's keeps it: OpenAI's "maximum context length" and "exceeds the context window", Anthropic's "prompt is too long" and "exceed context limit", Bedrock's "Input is too long for requested model", and, for the models Bedrock lets word it themselves and read only on an AWS `ValidationException`, since the words alone may be another provider's throttle, Amazon Nova's "Input Tokens Exceeded", Amazon Titan's "Too many input tokens" and the "prompt tokens (N) exceed model maximum (M)" of the models Bedrock serves through its OpenAI-compatible engine, read whole with its subject so that "max_tokens (N) exceed model maximum (M)", a parameter over its bound, is not read as the input's length, since Bedrock sends no code for it, Gemini's "exceeds the maximum number of tokens allowed") | `ProviderErrorMetadata.is_context_window_exceeded` → `CONTENT` / `CHANGE_INPUT`, not repeated; `model.context_exceeded`, the caller's → **HTTP 422**, whose parameters name the model and, as its `limit`, the context window, but neither the prompt's size nor the window's, which the provider words and never gives as numbers. The 400 arm and the other-4xx arm read it, ahead of the content-policy signal, for every family, and a 413 that carries no such signal keeps its payload-size reading, `input.too_large`. A language model's window holds the prompt and the output the request reserves with `max_tokens` together, and Anthropic's "exceed context limit" and OpenAI's "maximum context length" also refuse a request whose `max_tokens`, which may be the deck's default, pushes it over, so the language-model next step names both: shorten the input or lower `max_tokens`, or choose a model with a larger context window. The other families' next steps fit what their model reads: the prompt and its input images for an image model, the document for an extraction model, the inputs for a search or judgment model. Each phrase names the window or the inputs' length, so a 400 about a malformed request matches none of them |
-| Any other provider **HTTP 400** | `CONTENT` / `CHANGE_INPUT`, but `runtime.unexpected` → HTTP 500: a 400 nothing recognises is most likely a request of ours the provider could not take, and only a context-window or a content-policy signal makes it the caller's, `model.context_exceeded` or `model.content_refused` |
+| A provider **HTTP 400**, or another 4xx such as the 422 or 413 a gateway may answer, refusing a file, an image or a request payload as over its size limit (Anthropic's `request_too_large` type, or a provider's own wording, read in the rendered message and in the body: Anthropic's "The file exceeds the maximum allowed size.", its "Request exceeds the maximum allowed number of bytes." and its per-image "image exceeds 5 MB maximum", read with any limit, and Gemini's "Request payload size exceeds the limit") | `ProviderErrorMetadata.is_input_over_size_limit` → `CONTENT` / `CHANGE_INPUT`, not repeated; `input.too_large`, the caller's → **HTTP 422**, without its parameters, since a refusal in words never names the input and does not reliably give its size or the limit, so the caller reads the code's title, and the problem builder logs the parameters it lacks until the refusal names them. The 400 arm and the other-4xx arm read it after the context-window signal and before the content-policy signal, for every family, and the next step says that the request built from the inputs exceeds the provider's size limit and that the inputs should be made smaller or split, naming no file, since a refusal of a request's bytes or payload names none and a payload limit may be reached by the runtime's own choice to inline files; a 413 that carries no such signal reads `input.too_large` too, with the same next step, but keeps the `CONFIGURATION` category. A page fetch refusing the page at the caller's URL as too large to return whole (Linkup's `LinkupFetchResponseTooLargeError`, which reaches no status) reads `input.too_large` as well, and its next step points at a smaller page (`ProviderErrorMetadata.is_fetched_page_too_large`). Each phrase names the size of what was sent, so Anthropic's and OpenAI's refusals of a `max_tokens` over its bound, which also speak of a maximum, match none of them. OpenAI, Bedrock and Mistral document their size limits but no wording for the refusal, so none of theirs is read, and Gemini's "The document has no pages." is left out on purpose, since Gemini gives it to a file over its size and to a file it could not read alike |
+| Any other provider **HTTP 400** | `CONTENT` / `CHANGE_INPUT`, but `runtime.unexpected` → HTTP 500: a 400 nothing recognises is most likely a request of ours the provider could not take, and only a context-window, a size or a content-policy signal makes it the caller's, `model.context_exceeded`, `input.too_large` or `model.content_refused` |
 | Local file extractor raises a builtin (docling, pypdfium2) | `FileNotFoundError` → `input.reference_not_found`, `ValueError` / `RuntimeError` → `input.file_unreadable`, both `CONTENT` → **HTTP 422**; `OSError` → `UNKNOWN`, `runtime.unexpected` (see `_LOCAL_EXTRACT_BY_TYPE_NAME`) |
 | A text completion stops at its output limit or context window (`length`, `max_tokens`, `MAX_TOKENS`, an `incomplete` Responses answer at `max_output_tokens`, `model_context_window_exceeded`, `model_length`), with partial or empty text | Every LLM worker reads the stop before returning text and raises `LLMCompletionTruncatedError` → `CONTENT` / `CHANGE_INPUT`, not repeated: `model.output_truncated`, the method's, at the output limit, which the method's `max_tokens` sets, and `model.context_exceeded`, the input's, at the context window, both → **HTTP 422**. The message, for the operator, names the model, the pipe, the stop value, the output tokens used and the `max_tokens` sent, never the partial text; the caller reads the code's sentence, with the model and the token counts as its parameters. The error's `truncation_limit` tells the output limit from the context window (`model_context_window_exceeded`, `model_length`), and so does its code's next step: a higher `max_tokens` for the first, a shorter input for the second. A gateway in non-strict mode passing each provider's own value through the completions shape is read the same way, since the classifier reads the union of the provider vocabularies |
 | A text completion refused or stopped by a safety filter (`content_filter`, `refusal`, `content_filtered`, `guardrail_intervened`, Gemini's `SAFETY` and its kin), or a Gemini prompt blocked before any candidate (its `prompt_feedback.block_reason`, whatever its value) | `LLMCompletionRefusedError` → `CONTENT` / `CHANGE_INPUT`, not repeated; `model.content_refused` → **HTTP 422** |
@@ -25652,6 +25758,7 @@ InferenceErrorCategory.TRANSIENT.is_retryable  # True — only TRANSIENT
 | A step names, in an inline model setting, a model the deck neither defines nor names | `ModelNotFoundError`, which the lookup raises with `model.unknown` as the method's: **HTTP 422**, with a `change_model` step and a sentence naming the model as the method wrote it and the type of model the step needs. A model the deck itself names but does not serve (a preset or alias on a backend that is not enabled) keeps the class's `model.unavailable` → HTTP 501, in the operator's domain, whose caller step offers another model |
 | A method names a model a catalog of this deployment knows but no backend it enables serves (a backend switched off in `backends.toml`, such as `claude-4.5-haiku` with `anthropic` disabled) | `ModelNotFoundError` with `model.unavailable` → **HTTP 501**, the operator's, with the parameters `model`, `model_type` and the `reason` `not_served`, located on the pipe and its `model` field; the deck reads the handles every backend declares, enabled or not (`ModelDeck.is_cataloged_but_unserved`), so this is never the method's `model.unknown`. Validation answers it as no verdict, since the method is sound and this deployment cannot run it, and a run answers it before any pipe runs |
 | A `PipeParallel` cannot combine its branch results, or a pipe starts without a required input | The caller's own method or request: `pipe.output_multiplicity`, naming the first branch whose multiplicity differs from its field's, with one item per such branch when there are several, or `input.missing` at the entry pipe and `pipe.input_unresolved` below it → **HTTP 422**, each with its code's step, `change_method` for the method's codes and `change_input` for the input's |
+| A `PipeBatch` whose items a durable router judges would pass what its run's history holds, before its first item starts (`PipeRouterProtocol.check_batch_fits`) or during its fan-out | `PipeBatchTooWideError` (`pipelex/pipe_controllers/exceptions.py`), raised by the router with the batch's figures as keyword arguments, located at the `PipeBatch`: `input.too_large` → **HTTP 422**, whose `input` is the batched list as its author named it, `size` its item count and `limit` the largest item count that fits, so the caller reads "The input 'notes' reaches 2000, past the limit of 1714.", and when not even one item fits the problem withholds `limit` and the caller reads "The input 'notes' reaches 2000, past what the step that reads it accepts."; its message, the operator's, names the bytes and the events the batch would write and those left, and, for a batch stopped during its fan-out, how many items had started. A refused batch records no fan-out and starts no branch |
 | Unknown or ambiguous entry `pipe_code` (a CLI argument, a run request's field, the `--pipe` / `pipe_ref` slice selector of bundle validation) | `EntryPipeNotFoundError` / `EntryPipeAmbiguousError` → `UserAction(CHANGE_INPUT)`; `request.pipe_not_found`, `request.pipe_unspecified` or `request.pipe_ambiguous` → **HTTP 422**. The in-body lookups (`get_optional_pipe` / `get_required_pipe`) keep raising `PipeNotFoundError` / `PipeLibraryError`, whose codes are the method's: a ref written inside a bundle is not the caller's input |
 | A template naming a filter or a test that does not exist, found only when it renders | `Jinja2TemplateInvalidError` at the pipe, naming the filter or test and none of the template: `method.template_invalid` → **HTTP 422** for a method's `PipeCondition` expression, `PipeLLM` prompt or `PipeDocGen` template, and `runtime.unexpected` for one of Pipelex's own templates |
 | A URL or a storage key refused by the SSRF guard or the run's read scope | A `security.*` code saying whose the URL was: `security.input_url_refused` for one of the run's inputs, the default when the guard cannot tell, `security.method_url_refused` for one the method names and for a read refused inside a step, whose inputs were authorized when they were normalized, both → **HTTP 422**, and `security.provider_url_refused` for one in a model's generated answer, the runtime's → HTTP 502; a traversal in a storage key the caller supplied is `security.input_path_refused`, which `PipelineInputContentError` takes from its cause |
@@ -25680,7 +25787,7 @@ InferenceErrorCategory.TRANSIENT.is_retryable  # True — only TRANSIENT
 
 An error code names a situation a runner or a client can meet, and its type URI is the URL of the code's page. A code of the MTHDS standard, such as `input.missing`, is a core code, documented with the standard on [mthds.ai](https://mthds.ai/latest/errors/) at `https://mthds.ai/errors/<code>`. A code that starts with `pipelex.` names a situation the standard leaves to its implementations, and has its page here, at `https://docs.pipelex.com/errors/<code>`. Each page says what its code means, who must act and what to do, and gives the code's steps, parameters and templates.
 
-These pages are generated from the Pipelex error registry, which follows the [MTHDS error registry format](https://mthds.ai/latest/spec/error-registry/) under the `pipelex` prefix the core registry registers to Pipelex. The registry is published with every Pipelex release, as the release asset `pipelex-error-registry.json` on [GitHub](https://github.com/Pipelex/pipelex/releases) and inside the `pipelex` package. This is version `0.114.0` of the registry. [The Error Registry](../contribute/error-registry.md) describes how it is maintained.
+These pages are generated from the Pipelex error registry, which follows the [MTHDS error registry format](https://mthds.ai/latest/spec/error-registry/) under the `pipelex` prefix the core registry registers to Pipelex. The registry is published with every Pipelex release, as the release asset `pipelex-error-registry.json` on [GitHub](https://github.com/Pipelex/pipelex/releases) and inside the `pipelex` package. This is version `0.118.0` of the registry. [The Error Registry](../contribute/error-registry.md) describes how it is maintained.
 
 Every Pipelex error carries a code, one of these or a core code: its problem document names it as `code`, and its `type` is the code's page. The [Error Model](../under-the-hood/error-model.md#error-codes-and-the-pipelex-error-registry) describes how an error class declares the code it raises.
 
@@ -25748,6 +25855,7 @@ Pipelex's storage addresses and uploads.
 |---|---|---|---|---|
 | [`pipelex.storage.uri_invalid`](pipelex/storage/uri_invalid.md) | The storage address is malformed | `input` | `no` | `422` |
 | [`pipelex.storage.not_found`](pipelex/storage/not_found.md) | A stored file is gone | `runtime` | `no` | `500` |
+| [`pipelex.storage.object_missing`](pipelex/storage/object_missing.md) | No file is stored at this link | `input` | `no` | `404` |
 | [`pipelex.storage.damaged`](pipelex/storage/damaged.md) | A stored file is damaged | `runtime` | `no` | `500` |
 | [`pipelex.storage.unavailable`](pipelex/storage/unavailable.md) | Storage is unavailable | `runtime` | `yes` | `503` |
 | [`pipelex.storage.not_configured`](pipelex/storage/not_configured.md) | This deployment serves no storage for that address | `operator` | `no` | `500` |
@@ -25798,6 +25906,8 @@ The policies of a runner deployment.
 | [`pipelex.deployment.orchestration_override_forbidden`](pipelex/deployment/orchestration_override_forbidden.md) | This deployment does not allow choosing the orchestration mode | `input` | `no` | `422` |
 | [`pipelex.deployment.custom_code_requires_sandbox`](pipelex/deployment/custom_code_requires_sandbox.md) | Custom code needs a sandbox-hosted deployment | `operator` | `no` | `501` |
 | [`pipelex.deployment.python_structures_refused`](pipelex/deployment/python_structures_refused.md) | Python structure classes are not allowed here | `method` | `no` | `422` |
+| [`pipelex.deployment.declared_count_over_limit`](pipelex/deployment/declared_count_over_limit.md) | More items are asked for one slot than this runtime allows | `method` | `no` | `422` |
+| [`pipelex.deployment.dry_run_mock_budget_exceeded`](pipelex/deployment/dry_run_mock_budget_exceeded.md) | A dry run of the method would build more mock items than this runtime allows | `method` | `no` | `422` |
 | [`pipelex.deployment.token_claims_invalid`](pipelex/deployment/token_claims_invalid.md) | The token's claims cannot be used | `operator` | `no` | `500` |
 
 ## pipelex.docgen { #pipelex-docgen }
@@ -28096,7 +28206,7 @@ The server is tested with exactly the dependencies it declares, which are not th
 
 The root `make agent-check` ends with `make api-agent-check`, which runs `make -C api agent-check`: the member's install, ruff, pyright and mypy under its own configuration, then two drift checks. The root `make agent-test` ends with `make api-agent-test`, the server's unit tests. A library change that breaks the server therefore fails the gate in the change that makes it, and so does one that moves the server's wire or its inference tree:
 
-- **`make -C api openapi-check`** compares the committed OpenAPI artifact, `docs/api-server/openapi/pipelex-api.openapi.yaml`, with what the app generates. It sits among the server's pages, so the docs site publishes it beside the pages that link to it. pipelex's own models ride the server's wire (the run result, the bundle blueprint, the validation error vocabulary), so a library change can move the artifact with no change to the server's code. Regenerate it with `make -C api openapi-export` and read the diff: it is what the change did to the server's callers.
+- **`make -C api openapi-check`** compares the committed OpenAPI artifact, `docs/api-server/openapi/pipelex-api.openapi.yaml`, with what the app generates. The exporter reads the app as it boots by default, under the default `AUTH_MODE` and with `TRUST_FORWARDED_IDENTITY_HEADERS` off, whatever the environment or a `.env` sets, since both decide which routes are mounted, so the export and the check are the same on every machine. It sits among the server's pages, so the docs site publishes it beside the pages that link to it. pipelex's own models ride the server's wire (the run result, the bundle blueprint, the validation error vocabulary), so a library change can move the artifact with no change to the server's code. Regenerate it with `make -C api openapi-export` and read the diff: it is what the change did to the server's callers.
 - **`make -C api kit-check`** compares the server's vendored inference tree with the kit.
 
 ## Pull-request CI covers it
@@ -28992,7 +29102,7 @@ MTHDS Protocol  ⊂  Pipelex API (this server)  ⊂  Pipelex hosted API
 ```
 
 - **MTHDS Protocol** — the routes `POST /execute`, `POST /start`, `POST /validate`, `GET /models`, `GET /version`, and the blob routes `POST /blobs/missing` and `PUT /blobs/{sha256}`, which the protocol makes optional and this server serves, declaring `blob_store: true` on `/version`. Tagged `x-mthds-protocol: true` in the [committed OpenAPI artifact](openapi/pipelex-api.openapi.yaml), and **only** those — the flag is how a conformance suite or a third-party runner extracts the portable subset.
-- **Pipelex API (this server)** — the protocol verbatim, plus the Pipelex extensions: resolve and codegen (`/resolve`, `/codegen`), pipe I/O (`/pipe-io`), the model reference check (`/models/check`), and editor tooling (`/lint`, `/format`). `/upload` and `/resolve-storage-url` were non-contract convenience routes and have been **removed** — see [Storage Transport](storage-transport.md) for where they went and why.
+- **Pipelex API (this server)** — the protocol verbatim, plus the Pipelex extensions: resolve and codegen (`/resolve`, `/codegen`), pipe I/O (`/pipe-io`), the model reference check (`/models/check`), editor tooling (`/lint`, `/format`), and the storage transport that reads back what a run stores (`/resolve-storage-url/bulk` and the signed download links it resolves to, `/storage/{key}`), which serves the hosted platform's bulk resolve contract for this server's own storage. `/upload` and the single `/resolve-storage-url` were removed, as [Storage Transport](storage-transport.md) explains.
 - **Pipelex hosted API** (`api.pipelex.com/v1`) — everything here, same shapes, plus durable runs, the method catalog, and account management.
 
 All routes are served under the `/v1` base path (clients compose `{base}/v1/{endpoint}`).
@@ -29172,11 +29282,15 @@ List the models this runner can route to, and check one model reference against 
 
 [Learn more →](models.md)
 
-### Uploader (removed)
+### Storage Transport
+Read back what a run stores: a long text, a generated image or a received file travels in a run's answer as a `pipelex-storage://` reference, which a client resolves to a short-lived link and fetches. Pipelex API extensions serving the hosted platform's bulk resolve contract for this server's own storage, not mounted when the server trusts forwarded identity.
 
-`POST /v1/upload` and `POST /v1/resolve-storage-url` have been **removed** ([Storage Transport](storage-transport.md)). The storage provider itself is untouched — only the two HTTP routes are gone.
+- `POST /v1/resolve-storage-url/bulk` — Resolve up to 100 references to signed download links, one verdict per reference in request order; a caller resolves what its runs may read, only under its own `user_id` under `AUTH_MODE=jwt`, and a refused reference is a value on its item, never a failed request
+- `GET /v1/storage/{key}` — Download one stored object from its signed link (no bearer token: the signature authorizes it), under a validated bare media type that agrees with the type it was stored with
 
-For most use cases you don't need either: pass any public HTTP(S) URL (or base64 data URL) directly as `Document.content.url` and skip the upload step entirely.
+`POST /v1/upload` and the single `POST /v1/resolve-storage-url` are not served. To give a run a file, pass any public HTTP(S) URL (or base64 data URL) directly as `Document.content.url`.
+
+[Learn more →](storage-transport.md)
 
 
 ## Configuration
@@ -29254,16 +29368,27 @@ PIPELEX_ENV=dev
 # A method and the dependency trees it sends beside it are also bounded together:
 # MAX_METHOD_DEPENDENCIES=32          # dependency trees in one request
 # MAX_METHOD_REQUEST_TOTAL_KIB=131072 # bytes across the method's trees (default 128 MiB)
-# BLOB_UPLOAD_URL_TTL_SECONDS=3600    # how long an upload target stays valid
-# The address clients reach this API at, which upload targets start with. Set it
-# behind a proxy that terminates TLS or serves the API under a path prefix, since
-# the URL a request arrives at is then not the one a client can upload to. Unset,
-# a target starts with the URL of the request that asked for it.
+# BLOB_UPLOAD_URL_TTL_SECONDS=3600    # how long an upload target stays valid (at most 604800, seven days)
+# Blobs live in the configured storage under <scope>/blobs/.
+
+# ── Signed links: upload targets and stored-object downloads ──────────────
+# See pipe-run.md → "Sending files by hash" and storage-transport.md.
+# The address clients reach this API at, which every signed link starts with:
+# the upload targets of /v1/blobs/missing and the download links of
+# /v1/resolve-storage-url/bulk. Set it behind a proxy that terminates TLS or
+# serves the API under a path prefix, since the URL a request arrives at is then
+# not the one a client can reach. Unset, a link starts with the URL of the
+# request that asked for it.
 # PUBLIC_BASE_URL=https://runner.example.com
-# The key the upload targets are signed with. Unset, each process draws its own,
-# so a deployment serving one API through several instances sets it, the same on
-# every instance. Blobs live in the configured storage under <scope>/blobs/.
-# BLOB_UPLOAD_SIGNING_KEY=<a-long-random-secret>
+# The key every signed link is signed with, each kind of link under a purpose of
+# its own. Unset, each process draws its own, so its links stop holding when it
+# restarts, and a deployment serving one API through several instances or several
+# worker processes (`uvicorn --workers N`, or a host that sets WEB_CONCURRENCY)
+# sets it, the same on every instance and every worker.
+# LINK_SIGNING_KEY=<a-long-random-secret>
+# STORAGE_LINK_TTL_SECONDS=900        # how long a resolved download link stays valid (at most 604800, seven days)
+# A signed link stays valid for at most seven days, as an S3 presigned URL does:
+# the server refuses to start when either lifetime above is set past that cap.
 
 # ── Running a method by address (`method_ref`) ────────────────────────────
 # See pipe-run.md → "Running a method by address". All read at startup.
@@ -29543,7 +29668,7 @@ Execute a Pipelex pipeline with flexible inputs and wait for completion.
 - `pipe_code` (string, optional): The code identifying the pipe to execute. Beside a method sent in `files`, it names the pipe to start at in place of the method's entry pipe; beside `method_ref`, it overrides the package's `main_pipe`; sent alone, it must name a pipe already registered on the server.
 - `inputs` (PipelineInputs, optional): Flexible input format - see [Input Format: PipelineInputs](#input-format-pipelineinputs) below
 - `output_name` (string, optional): Name for the output slot
-- `output_multiplicity` (string, optional): Output multiplicity setting (`"single"`, `"variable"`, or a specific number)
+- `output_multiplicity` (string, optional): Output multiplicity setting (`"single"`, `"variable"`, or a specific number). A specific number is held to the maximum declared item count in force, and one above it is a `422` `pipelex.deployment.declared_count_over_limit` — see [Declared item count](#declared-item-count-max_declared_item_count).
 - `dynamic_output_concept_ref` (string, optional): Override output concept ref
 - `dependencies` (object, optional): **Pipelex-API extension.** The method packages the method calls by address that the runner cannot fetch, each a map of file entries keyed by its address — see [Sending the method packages the method calls](#sending-the-method-packages-the-method-calls). Accompanies `files`.
 - `method_ref` (string, optional): **Pipelex-API extension.** Run a published method by address instead of inline source — see [Running a method by address](#running-a-method-by-address-method_ref). Mutually exclusive with `mthds_contents` and with a method sent as a tree; `pipe_code` may accompany it to override the package's `main_pipe`.
@@ -29555,6 +29680,7 @@ Execute a Pipelex pipeline with flexible inputs and wait for completion.
 - `analytics_groups` (dict[str, str], optional): **Pipelex-API extension.** The groups this run's telemetry belongs to, such as `{"organization": "org_acme"}` — see [Host-supplied run context](#host-supplied-run-context-storage_scope-and-analytics_groups).
 - `method_key` (string, optional): **Pipelex-API extension.** Your own key of the stored method this run belongs to, sent beside the run's source — see [Run telemetry fields](#run-telemetry-fields).
 - `capture_pipe_codes` (boolean, optional): **Pipelex-API extension.** Whether this run's telemetry may carry its pipe codes, overriding the deployment's setting — see [Run telemetry fields](#run-telemetry-fields).
+- `max_declared_item_count` (integer, optional): **Pipelex-API extension.** The most items the method may declare for one slot, for this run alone, overriding the deployment's maximum — see [Declared item count](#declared-item-count-max_declared_item_count).
 - `pipeline_run_id` (string, optional): **Pipelex-API extension on `/execute`.** The run's id, chosen by the caller as on `/start`: the response and the run's webhooks carry it, and a run still in flight under the same id refuses the request with a `409` `pipelex.run.already_exists`. When absent, the server generates one. It must be one to 128 ASCII letters, digits, `_` or `-`, and neither `untitled` nor `dry_run_untitled`, which are reserved: any other value is a `422` `request.invalid` naming `pipeline_run_id`, before the run is registered.
 - `callback_urls` (list[str], optional): **Pipelex-API extension.** The URLs that each receive the run's signed `run.finished` event once it ends, before the response is sent; their delivery never changes the response, but a receiver that never answers delays it by about 51 seconds at most, the delivery's three attempts of 15 seconds and its waits between them. See [Webhooks](webhooks.md).
 
@@ -29663,7 +29789,7 @@ Start a pipeline execution and get its `pipeline_run_id` back with a `202` ack.
 - `pipe_code` (string, optional): The code identifying the pipe to execute. Beside a method sent in `files`, it names the pipe to start at in place of the method's entry pipe; beside `method_ref`, it overrides the package's `main_pipe`; sent alone, it must name a pipe already registered on the server.
 - `inputs` (PipelineInputs, optional): Flexible input format - see [Input Format: PipelineInputs](#input-format-pipelineinputs) below
 - `output_name` (string, optional): Name for the output slot
-- `output_multiplicity` (string, optional): Output multiplicity setting (`"single"`, `"variable"`, or a specific number)
+- `output_multiplicity` (string, optional): Output multiplicity setting (`"single"`, `"variable"`, or a specific number). A specific number is held to the maximum declared item count in force, and one above it is a `422` `pipelex.deployment.declared_count_over_limit` — see [Declared item count](#declared-item-count-max_declared_item_count).
 - `dynamic_output_concept_ref` (string, optional): Override output concept ref
 - `dependencies` (object, optional): **Pipelex-API extension.** The method packages the method calls by address that the runner cannot fetch, each a map of file entries keyed by its address — see [Sending the method packages the method calls](#sending-the-method-packages-the-method-calls). Accompanies `files`.
 - `method_ref` (string, optional): **Pipelex-API extension.** Run a published method by address instead of inline source — see [Running a method by address](#running-a-method-by-address-method_ref). Mutually exclusive with `mthds_contents` and with a method sent as a tree; `pipe_code` may accompany it to override the package's `main_pipe`.
@@ -29675,6 +29801,7 @@ Start a pipeline execution and get its `pipeline_run_id` back with a `202` ack.
 - `analytics_groups` (dict[str, str], optional): **Pipelex-API extension.** The groups this run's telemetry belongs to, such as `{"organization": "org_acme"}` — see [Host-supplied run context](#host-supplied-run-context-storage_scope-and-analytics_groups).
 - `method_key` (string, optional): **Pipelex-API extension.** Your own key of the stored method this run belongs to, sent beside the run's source — see [Run telemetry fields](#run-telemetry-fields).
 - `capture_pipe_codes` (boolean, optional): **Pipelex-API extension.** Whether this run's telemetry may carry its pipe codes, overriding the deployment's setting — see [Run telemetry fields](#run-telemetry-fields).
+- `max_declared_item_count` (integer, optional): **Pipelex-API extension.** The most items the method may declare for one slot, for this run alone, overriding the deployment's maximum — see [Declared item count](#declared-item-count-max_declared_item_count).
 - `callback_urls` (list[str], optional): **Pipelex-API extension.** The URLs that each receive the run's signed `run.finished` event once it ends. See [Webhooks](webhooks.md).
 
 **Validation Rules:**
@@ -29809,7 +29936,7 @@ The answer is `{"missing": [{"sha256": "…", "size": n, "upload": {"method": "P
 
 **Scopes.** Blobs live in the deployment's configured storage, under `<scope>/blobs/<sha256>`, and recorded listings under `<scope>/trees/<digest>`. The scope is the request's `read_scope`, which a multi-tenant host sends for the organization it serves (a query parameter on `POST /v1/blobs/missing`, a body field on the run and validate routes), else the caller's own id, so a hash entry resolves only in the caller's own blobs and asking whether a hash is held tells a caller nothing of another's files. On a `jwt` deployment a sent scope must lie under the caller's own id, else a `403` `auth.forbidden` whose `requirement` is `read_scope_under_caller` (see [Host-supplied run context](#host-supplied-run-context-storage_scope-and-analytics_groups)). A hash entry the runner does not hold, at the size it states, is a `422` `request.blobs_missing` whose `missing_blobs` parameter lists the hashes to upload before sending the request again.
 
-**Signing key.** Each process draws its own signing key unless `BLOB_UPLOAD_SIGNING_KEY` is set. A deployment serving one API through several instances must set it, the same on every instance, since an upload may reach another instance than the one that named its target.
+**Signing key.** Each process draws its own signing key unless `LINK_SIGNING_KEY` is set, the key that signs the download links of the [storage transport](storage-transport.md) too, each kind of link under a purpose of its own. A deployment serving one API through several instances or several worker processes (`uvicorn --workers N`, or a host that sets `WEB_CONCURRENCY`) must set it, the same on every instance and every worker, since an upload may reach another process than the one that named its target.
 
 ### Sending the method packages the method calls
 
@@ -29926,6 +30053,21 @@ Both `/execute` and `/start` also accept optional **Pipelex-API extensions** tha
 **`capture_pipe_codes`** says whether this run's telemetry may carry its pipe codes and output class names, overriding the deployment's `custom_posthog.tracing.capture.pipe_codes` for this run alone. `true` sends the real values in the span and trace names and in the `pipe_code` and `output_class_name` properties; `false` sends the redaction marker. The value travels with the run to every process that runs a part of it, so a worker's activities honour it too. Omit it, or send `null`, to keep the deployment's setting.
 
 ---
+
+## Declared item count: `max_declared_item_count`
+
+A method declares a fixed number of items for one slot with `Concept[N]` on an input or an output, or with a controller step's `nb_output = N`. The server holds each of those counts to a maximum when it loads the method, because a dry run builds one mock item per declared item. Without the field, the maximum is the deployment's `[interpreter.method_limits] max_declared_item_count`, 1,000 by default (see [Library Configuration](../configuration/config-technical/library-config.md#how-many-items-a-method-may-declare)). With it, the request states its own:
+
+```json
+{
+  "pipe_code": "summarize_reviews",
+  "max_declared_item_count": 500
+}
+```
+
+A method declaring more items for one slot than the maximum in force is refused with a `422` [`pipelex.deployment.declared_count_over_limit`](../errors/pipelex/deployment/declared_count_over_limit.md), whose parameters name the `slot`, the `count` and the `limit`, before the run starts. The run's own `output_multiplicity` is held to the same maximum: an integer above it is refused with the same `422`, its `slot` naming the run's output, before the run starts, since a live run would ask a model for that many items. The maximum travels with the run to every process that runs a part of it, so a worker's dry-run mock builders hold the request's maximum rather than their own deployment's. Whatever the maximum, an in-process dry run builds at most the deployment's `max_dry_run_mock_items` mock items in all, its mock inputs and its pipes together, past which it is refused with [`pipelex.deployment.dry_run_mock_budget_exceeded`](../errors/pipelex/deployment/dry_run_mock_budget_exceeded.md).
+
+The value must be a JSON integer, never a boolean or a string such as `"500"`, from 1 to the deployment's `[interpreter.method_limits] max_declared_item_count_ceiling`, 1,000 by default; any other is a `422` `request.invalid` naming the field. The field only raises the maximum, never lowers it: the maximum in force is the larger of the request's and the deployment's `max_declared_item_count`, so a value below the deployment's is accepted and changes nothing, and a method from the host's own library directories is never refused for what a request states. It raises the maximum only as far as the ceiling allows: the field arrives in the request's JSON, so by default no caller can raise its own limit. A deployment behind a trusted front that sets each request's maximum itself, such as a multi-tenant host sending the maximum of the caller's plan, raises the ceiling to the highest maximum that front sends. Omit the field, or send `null`, to keep the deployment's maximum. The same field is taken by [`/v1/validate`](pipe-validate.md) and by the method routes `/v1/resolve`, `/v1/codegen` and `/v1/pipe-io`.
 
 ## Input Format: PipelineInputs
 
@@ -30435,6 +30577,7 @@ The method to validate is sent in `files`, a map from each file's path in the me
 - `method_ref` (string, optional): **Pipelex-API extension.** Validate a published method by address — `github.com/<owner>/<repo>` plus an optional package selector and `@<tag>` — resolved by this server through the same fetch path as a [`method_ref` run](pipe-run.md#running-a-method-by-address-method_ref): the repository is fetched at the tag, the package located by manifest identity, and its tree read from the commit's git objects and validated as a tree sent in `files` is — see [Validating a method tree](#validating-a-method-tree). Exactly one of `files` / `method_ref` / `mthds_contents`; `mthds_sources` cannot accompany it. A package holding Python and a `requirements.txt` has its requirements checked on this server against the packages the deployment's PipeFunc sandbox offers for them before anything is validated, and a requirement the sandbox does not meet, or a line the standard refuses, makes the verdict `is_valid: false` with one item per line, whose `source` is `requirements.txt` and whose `line` is the line's number; a deployment refusing the requirements with its own explanation, no environment it can build holding them, makes it `is_valid: false` with one item on `requirements.txt` and no line
 - `mthds_contents` (list[str], optional): **Being retired: send the method in `files`.** MTHDS contents to validate (always an array, even for a single file). Exactly one of `files` / `method_ref` / `mthds_contents` must be provided. Still accepted until a later release refuses it
 - `read_scope` (string, optional): **Pipelex-API extension.** The scope the validation reads the method under, as a run's `read_scope`, which a multi-tenant host sends for the organization it serves; [a `jwt` caller may send only a scope under its own id](pipe-run.md#host-supplied-run-context-storage_scope-and-analytics_groups), else a `403` `auth.forbidden` whose `requirement` is `read_scope_under_caller`. A hash entry of `files` resolves in that scope's blob store — see [Sending files by hash](pipe-run.md#sending-files-by-hash) — and the runner hands the scope to its validator, so a validation dispatched to a worker can hand it the method through that store — see [Where validation runs](#where-validation-runs). Omitted, a hash entry resolves in the caller's own id's store, but only a validation carrying it records the tree it read in the blob store, and the validator is handed no scope, so a dry run without one leaves nothing stored
+- `max_declared_item_count` (integer, optional): **Pipelex-API extension.** Raises, for this validation alone, the most items the method may declare for one slot, an input or an output written `Concept[N]` or a controller step's `nb_output`: the larger of it and the deployment's maximum is in force, so a lower value changes nothing. The validation loads the method under that maximum, so a method declaring more is the invalid verdict `pipelex.deployment.declared_count_over_limit`, and a validation dispatched to a worker hands the worker the same maximum — see [Declared item count](pipe-run.md#declared-item-count-max_declared_item_count). It must be a JSON integer, never a boolean or a string, from 1 to the deployment's `max_declared_item_count_ceiling`, 1,000 by default; any other value is a `422` `request.invalid` naming the field.
 - `allow_signatures` (boolean, optional, default `false`): controls only the **sweep mechanics** for `PipeSignature` placeholders — whether signature pipes are mock-run during the dry-run sweep and therefore listed in `validated_pipes`. It does **not** change the verdict: an unimplemented signature is never a rejection, it is a *runnability fact* reported via `pending_signatures` + `is_runnable` in both modes
 - `mthds_sources` (list[str] | null, optional): **Being retired with `mthds_contents`: the files of a method sent in `files` are named by their tree paths.** Per-file sources, parallel to `mthds_contents` — see [Sourcing submitted files](#sourcing-submitted-files). When present it must match `mthds_contents` in length (a mismatch is a 422 request error), and it accompanies `mthds_contents` alone, since a tree's files are named by their tree paths
 - `resources` (object | null, optional): **Pipelex-API extension, being retired with `mthds_contents`: put the files in the method's tree, in `files`.** The files the bundle's steps read, such as a `PipeDocGen` step's `template_file`, as a map from the path the step names to the file's bytes in standard base64 — see [Sending the files the steps read](#sending-the-files-the-steps-read-resources). It accompanies `mthds_contents` or `files`, whose tree each file joins; beside `method_ref` it is a 422
@@ -30676,6 +30819,7 @@ The body names the method as the [crate routes](codegen.md#selecting-the-method)
 - `include_files` (boolean, default `false`): echo the text of the method's own `.mthds` bundles on the valid arm.
 - `resources` (object, optional): **Being retired, and refused by a later release: a file the steps read travels inside the method's tree, in `files`, at its path beside the bundle that names it.** Files the method's steps read, such as a `PipeDocGen` step's `template_file`, keyed by the path from the tree's root, each in standard base64, joining the tree as on [`/v1/validate`](pipe-validate.md#sending-the-files-the-steps-read-resources). It accompanies `files` only. A step whose template file the tree does not hold makes the method invalid.
 - `read_scope` (string, optional): **Pipelex-API extension.** The scope the request reads the method under, as on `/v1/validate`: a hash entry of `files` resolves in that scope's blob store, and only a request carrying it records the tree it read there; [a `jwt` caller may send only a scope under its own id](pipe-run.md#host-supplied-run-context-storage_scope-and-analytics_groups), else a `403` `auth.forbidden` whose `requirement` is `read_scope_under_caller`.
+- `max_declared_item_count` (integer, optional): **Pipelex-API extension.** Raises, for this request alone, the most items the method may declare for one slot, as on a [run](pipe-run.md#declared-item-count-max_declared_item_count): the larger of it and the deployment's maximum is in force, so a lower value changes nothing, and the method loads under that maximum, so a method declaring more is refused as invalid with `pipelex.deployment.declared_count_over_limit`. It must be a JSON integer, never a boolean or a string, from 1 to the deployment's `max_declared_item_count_ceiling`, 1,000 by default; any other value is a `422` `request.invalid` naming the field.
 
 There is no `views` field, because the valid arm always carries all three artifacts. The hosted API also accepts a catalog `method_id`, which the platform resolves into the method's `files` before forwarding, so this server never declares it.
 
@@ -30777,6 +30921,7 @@ Providing neither or both is a request-shape `422`. Beside `files`, the request 
 - `dependencies` (object): the method packages the method calls by address, each a map of file entries keyed by its address, as on a [run](pipe-run.md#sending-the-method-packages-the-method-calls). They are loaded beside the method, never merged into it, so a cross-package call resolves without the server fetching or holding a copy. `dependencies` without `files` is a request-shape `422`.
 - `resources` (object): **Being retired, and refused by a later release: a file the steps read travels inside the method's tree, in `files`, at its path beside the bundle that names it.** Files the method's steps read, such as a `PipeDocGen` step's `template_file`, keyed by the path from the tree's root, each in standard base64, joining the tree with the rules and refusals of [`/v1/validate`](pipe-validate.md#sending-the-files-the-steps-read-resources). A step that names a template file the tree does not hold cannot be built, so the method is invalid. `resources` beside a `method_ref` is a request-shape `422`: a published method's files are its package's own.
 - `read_scope` (string): **Pipelex-API extension.** The scope the request reads the method under, as on `/v1/validate`: a hash entry of `files` resolves in that scope's blob store, else in the caller's own id's, and only a request carrying a `read_scope` records the tree it read in the blob store; [a `jwt` caller may send only a scope under its own id](pipe-run.md#host-supplied-run-context-storage_scope-and-analytics_groups), else a `403` `auth.forbidden` whose `requirement` is `read_scope_under_caller`.
+- `max_declared_item_count` (integer, optional): **Pipelex-API extension.** Raises, for this request alone, the most items the method may declare for one slot, as on a [run](pipe-run.md#declared-item-count-max_declared_item_count): the larger of it and the deployment's maximum is in force, so a lower value changes nothing, and the method loads under that maximum, so a method declaring more is refused as invalid with `pipelex.deployment.declared_count_over_limit`. It must be a JSON integer, never a boolean or a string, from 1 to the deployment's `max_declared_item_count_ceiling`, 1,000 by default; any other value is a `422` `request.invalid` naming the field.
 
 **The tree's refusals produce no verdict**, exactly as on `/v1/validate`: a key the tree's rule refuses is a `422` `method.package_invalid` naming the rule as its `reason`, or `security.input_path_refused` for a key leaving the tree's root, a malformed entry a `422` `request.invalid`, a hash the runner does not hold a `422` `request.blobs_missing`, a tree past its limits a `422` `method.package_invalid` naming the limit, and a tree holding no `.mthds` bundle of its own a `422` `method.package_invalid` whose `reason` is `no_bundle`. A `files` member that is not a map, such as a list, is a `422` `request.invalid` naming `files`.
 
